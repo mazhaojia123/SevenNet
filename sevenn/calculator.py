@@ -218,7 +218,146 @@ class SevenNetCalculator(Calculator):
             data = data.to_dict()
             del data['data_info']
 
-        self.results = self.output_to_results(self.model(data))
+        import logging
+        logging.debug(f"data: {data}")
+        logging.debug(f"data[pos]: {data['pos']}")
+        logging.debug(f"data[x]: {data['x']}")
+        logging.debug(f"data[cell_lattice_vectors]: {data['cell_lattice_vectors']}")
+        logging.debug(f"data[cell_volume]: {data['cell_volume']}")
+        output = self.model(data)
+        # logging.info(f"input: {data}")
+        # logging.info(f"output[{KEY.PRED_TOTAL_ENERGY}] = {output[KEY.PRED_TOTAL_ENERGY]}")
+        # logging.info(f"output[{KEY.PRED_FORCE}] = {output[KEY.PRED_FORCE]}")
+        # logging.info(f"output[{KEY.PRED_STRESS}] = {output[KEY.PRED_STRESS]}")
+        self.results = self.output_to_results(output)
+        logging.debug(f"results['energy'] = {self.results['energy']}")
+        logging.debug(f"results['forces'] = {self.results['forces']}")
+        logging.debug(f"results['stress'] = {self.results['stress']}")
+
+    def predict_one(self, atoms):
+        if atoms is None:
+            raise ValueError('No atoms to evaluate')
+        data = AtomGraphData.from_numpy_dict(
+            unlabeled_atoms_to_graph(atoms, self.cutoff)
+        )
+        if self.modal:
+            data[KEY.DATA_MODALITY] = self.modal
+
+        data.to(self.device)  # type: ignore
+
+        if isinstance(self.model, torch_script_type):
+            data[KEY.NODE_FEATURE] = torch.tensor(
+                [self.type_map[z.item()] for z in data[KEY.NODE_FEATURE]],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            data[KEY.POS].requires_grad_(True)  # backward compatibility
+            data[KEY.EDGE_VEC].requires_grad_(True)  # backward compatibility
+            data = data.to_dict()
+            del data['data_info']
+
+        return self.model(data)
+
+
+
+    def predict(self, atoms_list, properties=None):
+        
+        if len(atoms_list) == 1:
+            output = self.predict_one(atoms_list[0])
+            predictions = {}
+            predictions['energy'] = output[KEY.PRED_TOTAL_ENERGY].to(torch.float64).unsqueeze(0)
+            predictions['forces'] = output[KEY.PRED_FORCE].to(torch.float64).unsqueeze(0)
+            voigt = (-output[KEY.PRED_STRESS])[[0, 1, 2, 4, 5, 3]].to(torch.float64).unsqueeze(0)
+            stress_list = []
+            for i in range(voigt.shape[0]):
+                stress_list.append(self._stress2tensor(voigt[i,:]))
+            predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3)
+            return predictions
+
+
+        if not atoms_list:
+            raise ValueError("Empty atoms_list provided")
+            
+        if not isinstance(atoms_list, list):
+            atoms_list = [atoms_list]
+            
+        # Convert atoms to graph data
+        graph_list = []
+        for atoms in atoms_list:
+            data = AtomGraphData.from_numpy_dict(
+                unlabeled_atoms_to_graph(atoms, self.cutoff)
+            )
+            if self.modal:
+                data[KEY.DATA_MODALITY] = self.modal
+                
+            if isinstance(self.model, torch_script_type):
+                data[KEY.NODE_FEATURE] = torch.tensor(
+                    [self.type_map[z.item()] for z in data[KEY.NODE_FEATURE]],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                data[KEY.POS].requires_grad_(True)  # backward compatibility
+                data[KEY.EDGE_VEC].requires_grad_(True)  # backward compatibility
+                
+            graph_list.append(data)
+            
+        # Process graphs based on model type
+        # was_batch_mode = True
+        if isinstance(self.model, AtomGraphSequential):
+            # was_batch_mode = self.model.is_batch_data
+            self.model.set_is_batch_data(True)
+            self.model.eval()
+            
+        # Batch the data if there are multiple atoms
+        from torch_geometric.loader.dataloader import Collater
+        batched_data = Collater(graph_list)(graph_list)
+        batched_data = batched_data.to(self.device)
+        
+        import logging
+        logging.debug(f"batched_data: {batched_data}")
+        logging.debug(f"batched_data[pos]: {batched_data['pos']}")
+        logging.debug(f"batched_data[x]: {batched_data['x']}")
+        logging.debug(f"batched_data[cell_lattice_vectors]: {batched_data['cell_lattice_vectors']}")
+        logging.debug(f"batched_data[cell_volume]: {batched_data['cell_volume']}")
+        # Run model on batched data
+        if isinstance(self.model, torch_script_type):
+            batched_dict = batched_data.to_dict()
+            if 'data_info' in batched_dict:
+                del batched_dict['data_info']
+            output = self.model(batched_dict)
+        else:
+            output = self.model(batched_data)
+            
+        # Convert to list of individual outputs using util.to_atom_graph_list
+        # logging.info(f"input: {batched_data}")
+        # logging.info(f"output[{KEY.PRED_TOTAL_ENERGY}] = {output[KEY.PRED_TOTAL_ENERGY]}")
+        # logging.info(f"output[{KEY.PRED_FORCE}] = {output[KEY.PRED_FORCE]}")
+        # logging.info(f"output[{KEY.PRED_STRESS}] = {output[KEY.PRED_STRESS]}")
+
+        predictions = {}
+        predictions['energy'] = output[KEY.PRED_TOTAL_ENERGY].to(torch.float64)
+        predictions['forces'] = output[KEY.PRED_FORCE].to(torch.float64)
+        voigt = (-output[KEY.PRED_STRESS])[:, [0, 1, 2, 4, 5, 3]].to(torch.float64)
+        stress_list = []
+        for i in range(voigt.shape[0]):
+            stress_list.append(self._stress2tensor(voigt[i,:]))
+        predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3)
+
+        logging.debug(f"predictions['energy'] = {predictions['energy']}")
+        logging.debug(f"predictions['forces'] = {predictions['forces']}")
+        logging.debug(f"predictions['stress'] = {predictions['stress']}")
+        return predictions
+
+    def _stress2tensor(self, stress):
+        tensor = torch.tensor(
+            [
+                [stress[0], stress[3], stress[4]],
+                [stress[3], stress[1], stress[5]],
+                [stress[4], stress[5], stress[2]],
+            ], 
+            device=self.device
+        )
+        return tensor
 
 
 class SevenNetD3Calculator(SumCalculator):
