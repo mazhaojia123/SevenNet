@@ -17,6 +17,7 @@ import sevenn.util as util
 from sevenn.atom_graph_data import AtomGraphData
 from sevenn.nn.sequential import AtomGraphSequential
 from sevenn.train.dataload import unlabeled_atoms_to_graph
+import logging
 
 torch_script_type = torch.jit._script.RecursiveScriptModule
 
@@ -60,6 +61,7 @@ class SevenNetCalculator(Calculator):
         sevennet_config: dict | None, default=None
             Not used, but can be used to carry meta information of this calculator
         """
+        print("&&& Initializing SevenNetCalculator")
         super().__init__(**kwargs)
         self.sevennet_config = None
 
@@ -195,6 +197,7 @@ class SevenNetCalculator(Calculator):
         }
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+        print("call 7net calculate...")
         # call parent class to set necessary atom attributes
         Calculator.calculate(self, atoms, properties, system_changes)
         if atoms is None:
@@ -220,8 +223,8 @@ class SevenNetCalculator(Calculator):
 
         import logging
         logging.debug(f"data: {data}")
-        logging.debug(f"data[pos]: {data['pos']}")
-        logging.debug(f"data[x]: {data['x']}")
+        # logging.debug(f"data[pos]: {data['pos']}")
+        # logging.debug(f"data[x]: {data['x']}")
         logging.debug(f"data[cell_lattice_vectors]: {data['cell_lattice_vectors']}")
         logging.debug(f"data[cell_volume]: {data['cell_volume']}")
         output = self.model(data)
@@ -230,9 +233,9 @@ class SevenNetCalculator(Calculator):
         # logging.info(f"output[{KEY.PRED_FORCE}] = {output[KEY.PRED_FORCE]}")
         # logging.info(f"output[{KEY.PRED_STRESS}] = {output[KEY.PRED_STRESS]}")
         self.results = self.output_to_results(output)
-        logging.debug(f"results['energy'] = {self.results['energy']}")
-        logging.debug(f"results['forces'] = {self.results['forces']}")
-        logging.debug(f"results['stress'] = {self.results['stress']}")
+        # logging.debug(f"results['energy'] = {self.results['energy']}")
+        # logging.debug(f"results['forces'] = {self.results['forces']}")
+        # logging.debug(f"results['stress'] = {self.results['stress']}")
 
     def predict_one(self, atoms):
         if atoms is None:
@@ -262,17 +265,17 @@ class SevenNetCalculator(Calculator):
 
     def predict(self, atoms_list, properties=None):
         
-        if len(atoms_list) == 1:
-            output = self.predict_one(atoms_list[0])
-            predictions = {}
-            predictions['energy'] = output[KEY.PRED_TOTAL_ENERGY].to(torch.float64).unsqueeze(0)
-            predictions['forces'] = output[KEY.PRED_FORCE].to(torch.float64).unsqueeze(0)
-            voigt = (-output[KEY.PRED_STRESS])[[0, 1, 2, 4, 5, 3]].to(torch.float64).unsqueeze(0)
-            stress_list = []
-            for i in range(voigt.shape[0]):
-                stress_list.append(self._stress2tensor(voigt[i,:]))
-            predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3)
-            return predictions
+        # if len(atoms_list) == 1:
+        #     output = self.predict_one(atoms_list[0])
+        #     predictions = {}
+        #     predictions['energy'] = output[KEY.PRED_TOTAL_ENERGY].to(torch.float64).unsqueeze(0)
+        #     predictions['forces'] = output[KEY.PRED_FORCE].to(torch.float64).unsqueeze(0)
+        #     voigt = (-output[KEY.PRED_STRESS])[[0, 1, 2, 4, 5, 3]].to(torch.float64).unsqueeze(0)
+        #     stress_list = []
+        #     for i in range(voigt.shape[0]):
+        #         stress_list.append(self._stress2tensor(voigt[i,:]))
+        #     predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3)
+        #     return predictions
 
 
         if not atoms_list:
@@ -315,8 +318,8 @@ class SevenNetCalculator(Calculator):
         
         import logging
         logging.debug(f"batched_data: {batched_data}")
-        logging.debug(f"batched_data[pos]: {batched_data['pos']}")
-        logging.debug(f"batched_data[x]: {batched_data['x']}")
+        # logging.debug(f"batched_data[pos]: {batched_data['pos']}")
+        # logging.debug(f"batched_data[x]: {batched_data['x']}")
         logging.debug(f"batched_data[cell_lattice_vectors]: {batched_data['cell_lattice_vectors']}")
         logging.debug(f"batched_data[cell_volume]: {batched_data['cell_volume']}")
         # Run model on batched data
@@ -335,25 +338,25 @@ class SevenNetCalculator(Calculator):
         # logging.info(f"output[{KEY.PRED_STRESS}] = {output[KEY.PRED_STRESS]}")
 
         predictions = {}
-        predictions['energy'] = output[KEY.PRED_TOTAL_ENERGY].to(torch.float64)
-        predictions['forces'] = output[KEY.PRED_FORCE].to(torch.float64)
-        voigt = (-output[KEY.PRED_STRESS])[:, [0, 1, 2, 4, 5, 3]].to(torch.float64)
+        predictions['energy'] = output[KEY.PRED_TOTAL_ENERGY].to(torch.float64).detach()
+        predictions['forces'] = output[KEY.PRED_FORCE].to(torch.float64).detach()
+        voigt = (-output[KEY.PRED_STRESS])[:, [0, 1, 2, 4, 5, 3]].to(torch.float64).detach()
         stress_list = []
         for i in range(voigt.shape[0]):
             stress_list.append(self._stress2tensor(voigt[i,:]))
-        predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3)
+        predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3).detach()
 
-        logging.debug(f"predictions['energy'] = {predictions['energy']}")
-        logging.debug(f"predictions['forces'] = {predictions['forces']}")
-        logging.debug(f"predictions['stress'] = {predictions['stress']}")
+        # logging.debug(f"predictions['energy'] = {predictions['energy']}")
+        # logging.debug(f"predictions['forces'] = {predictions['forces']}")
+        # logging.debug(f"predictions['stress'] = {predictions['stress']}")
         return predictions
 
     def _stress2tensor(self, stress):
         tensor = torch.tensor(
             [
-                [stress[0], stress[3], stress[4]],
-                [stress[3], stress[1], stress[5]],
-                [stress[4], stress[5], stress[2]],
+                [stress[0], stress[5], stress[4]],
+                [stress[5], stress[1], stress[3]],
+                [stress[4], stress[3], stress[2]],
             ], 
             device=self.device
         )
