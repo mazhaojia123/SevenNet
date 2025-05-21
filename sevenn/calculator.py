@@ -197,7 +197,6 @@ class SevenNetCalculator(Calculator):
         }
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
-        print("call 7net calculate...")
         # call parent class to set necessary atom attributes
         Calculator.calculate(self, atoms, properties, system_changes)
         if atoms is None:
@@ -374,6 +373,7 @@ class SevenNetD3Calculator(SumCalculator):
         functional_name: str = 'pbe',
         vdw_cutoff: float = 9000,  # au^2, 0.52917726 angstrom = 1 au
         cn_cutoff: float = 1600,  # au^2, 0.52917726 angstrom = 1 au
+        batch_size=10,
         **kwargs,
     ):
         """Initialize SevenNetD3Calculator. CUDA required.
@@ -401,7 +401,7 @@ class SevenNetD3Calculator(SumCalculator):
         cn_cutoff: float, default=1600
             cn cutoff of D3 calculator in au
         """
-        d3_calc = D3Calculator(
+        self.d3_calc = D3Calculator(
             damping_type=damping_type,
             functional_name=functional_name,
             vdw_cutoff=vdw_cutoff,
@@ -409,7 +409,7 @@ class SevenNetD3Calculator(SumCalculator):
             **kwargs,
         )
 
-        sevennet_calc = SevenNetCalculator(
+        self.sevennet_calc = SevenNetCalculator(
             model=model,
             file_type=file_type,
             device=device,
@@ -417,7 +417,63 @@ class SevenNetD3Calculator(SumCalculator):
             **kwargs,
         )
 
-        super().__init__([sevennet_calc, d3_calc])
+        super().__init__([self.sevennet_calc, self.d3_calc])
+
+        self.device = device
+        self.d3_calcs = []
+        for _ in range(batch_size):
+            self.d3_calcs.append(
+                D3Calculator(
+                    damping_type=damping_type,
+                    functional_name=functional_name,
+                    vdw_cutoff=vdw_cutoff,
+                    cn_cutoff=cn_cutoff,
+                    **kwargs,
+                )
+            )
+
+
+    def predict(self, atoms_list):
+        """Predict the energy and forces for a list of atoms.
+        """
+        # Call the predict method of the first calculator (SevenNetCalculator)
+        predictions = self.sevennet_calc.predict(atoms_list)
+        
+        energy_list = []
+        forces_list = []
+        stress_list = []
+        predictions3d = {}
+        for i, atoms in enumerate(atoms_list):
+            prediction = self.d3_calcs[i].predict_one(atoms)
+            energy_list.append(torch.tensor(prediction['energy']))
+            forces_list.append(torch.from_numpy(prediction['forces']).to(self.device))
+            stress_list.append(self._stress2tensor(torch.from_numpy(prediction['stress'])))
+
+        # Convert lists to tensors
+        predictions3d['energy'] = torch.stack(energy_list, dim=0).to(self.device)
+        predictions3d['forces'] = torch.cat(forces_list, dim=0).view(-1, 3)
+        predictions3d['stress'] = torch.stack(stress_list, dim=0).view(-1, 3, 3)
+
+        predictions['energy'] += predictions3d['energy'].detach()
+        predictions['forces'] += predictions3d['forces'].detach()
+        predictions['stress'] += predictions3d['stress'].detach()
+        
+        return predictions
+
+    def _stress2tensor(self, stress):
+        tensor = torch.tensor(
+            [
+                # [stress[0], stress[3], stress[4]],
+                # [stress[3], stress[1], stress[5]],
+                # [stress[4], stress[5], stress[2]],
+                [stress[0], stress[5], stress[4]],
+                [stress[5], stress[1], stress[3]],
+                [stress[4], stress[3], stress[2]],
+            ], 
+            device=self.device
+        )
+        return tensor
+
 
 
 def _load(name: str) -> ctypes.CDLL:
@@ -693,8 +749,98 @@ class D3Calculator(Calculator):
             'stress': result_S,
         }
 
+    def predict_one(self, atoms):
+        atoms = atoms.copy()
+        if atoms is None:
+            raise ValueError('No atoms to evaluate')
+
+        if atoms.get_cell().sum() == 0:
+            print(
+                'Warning: D3Calculator requires a cell.\n'
+                'Warning: An orthogonal cell large enough is generated.'
+            )
+            positions = atoms.get_positions()
+            min_pos = positions.min(axis=0)
+            max_pos = positions.max(axis=0)
+            max_cutoff = np.sqrt(max(self.rthr, self.cnthr)) * 0.52917726
+
+            cell_lengths = max_pos - min_pos + max_cutoff + 1.0  # extra margin
+            cell = np.eye(3) * cell_lengths
+
+            atoms.set_cell(cell)
+            atoms.set_pbc([True, True, True])  # for minus positions
+
+        cell, rotator = self._convert_domain_ase2lammps(atoms.get_cell())
+
+        Z_of_atoms = atoms.get_atomic_numbers()
+        natoms = len(atoms)
+        ntypes = len(set(Z_of_atoms))
+        types = (ctypes.c_int * natoms)(*self._idx_to_types(Z_of_atoms))
+
+        positions = atoms.get_positions() @ rotator.T
+        x_flat = (ctypes.c_double * (natoms * 3))(*positions.flatten())
+
+        atomic_numbers = (ctypes.c_int * ntypes)(*self._idx_to_numbers(Z_of_atoms))
+
+        boxlo = (ctypes.c_double * 3)(0.0, 0.0, 0.0)
+        boxhi = (ctypes.c_double * 3)(cell[0], cell[1], cell[2])
+        xy = cell[3]
+        xz = cell[4]
+        yz = cell[5]
+        xperiodic, yperiodic, zperiodic = atoms.get_pbc()
+
+        lib = self._lib
+        assert lib is not None
+        lib.pair_set_atom(self.pair, natoms, ntypes, types, x_flat)
+
+        xperiodic = xperiodic.astype(int)
+        yperiodic = yperiodic.astype(int)
+        zperiodic = zperiodic.astype(int)
+        lib.pair_set_domain(
+            self.pair, xperiodic, yperiodic, zperiodic, boxlo, boxhi, xy, xz, yz
+        )
+
+        lib.pair_run_settings(
+            self.pair,
+            self.rthr,
+            self.cnthr,
+            self.damp_name.encode('utf-8'),
+            self.func_name.encode('utf-8'),
+        )
+
+        lib.pair_run_coeff(self.pair, atomic_numbers)
+        lib.pair_run_compute(self.pair)
+
+        result_E = lib.pair_get_energy(self.pair)
+
+        result_F_ptr = lib.pair_get_force(self.pair)
+        result_F_size = natoms * 3
+        result_F = np.ctypeslib.as_array(
+            result_F_ptr, shape=(result_F_size,)
+        ).reshape((natoms, 3))
+        result_F = np.array(result_F)
+        result_F = result_F @ rotator
+
+        result_S = lib.pair_get_stress(self.pair)
+        result_S = np.array(result_S.contents)
+        result_S = (
+            self._tensor2stress(rotator.T @ self._stress2tensor(result_S) @ rotator)
+            / atoms.get_volume()
+        )
+
+        prediction = {
+            'free_energy': float(result_E),
+            'energy': float(result_E),
+            'forces': result_F.copy(),
+            'stress': result_S.copy(),
+        }
+
+        return prediction
+
+
     def __del__(self):
         if self._lib is not None:
             self._lib.pair_fin(self.pair)
             self._lib = None
             self.pair = None
+
