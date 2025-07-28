@@ -260,9 +260,8 @@ class SevenNetCalculator(Calculator):
 
         return self.model(data)
 
-
-
-    def predict(self, atoms_list, properties=None):
+    # for test use
+    def ingre_predict(self, gbatch, atoms_list, properties=None):
         
         # if len(atoms_list) == 1:
         #     output = self.predict_one(atoms_list[0])
@@ -276,6 +275,7 @@ class SevenNetCalculator(Calculator):
         #     predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3)
         #     return predictions
 
+        import logging
 
         if not atoms_list:
             raise ValueError("Empty atoms_list provided")
@@ -283,9 +283,14 @@ class SevenNetCalculator(Calculator):
         if not isinstance(atoms_list, list):
             atoms_list = [atoms_list]
             
+        logging.info(f"type(atoms_list): {type(atoms_list)}")
+
         # Convert atoms to graph data
         graph_list = []
         for atoms in atoms_list:
+            logging.info(f"type(atoms): {type(atoms)}")
+            logging.info(f"atoms: {atoms}")
+
             data = AtomGraphData.from_numpy_dict(
                 unlabeled_atoms_to_graph(atoms, self.cutoff)
             )
@@ -300,6 +305,10 @@ class SevenNetCalculator(Calculator):
                 )
                 data[KEY.POS].requires_grad_(True)  # backward compatibility
                 data[KEY.EDGE_VEC].requires_grad_(True)  # backward compatibility
+
+            logging.info(f"type(data): {type(data)}")
+            logging.info(f"data: {data}")
+            logging.info(f"data.node_attr: {data.node_attr}")
                 
             graph_list.append(data)
             
@@ -314,8 +323,47 @@ class SevenNetCalculator(Calculator):
         from torch_geometric.loader.dataloader import Collater
         batched_data = Collater(graph_list)(graph_list)
         batched_data = batched_data.to(self.device)
+
+        new_batch = self.convert_batch(gbatch)
+
+        # TODO: compare batched_data and new_batch to see whether they are same
+        def compare_batch(new_batch, old_batch):
+            all_same = True
+
+            for key in old_batch:
+                if not hasattr(new_batch, key[0]):
+                    logging.info(f"attr {key} is not in new_batch")
+                    all_same = False
+                    continue
+
+                new_val = getattr(new_batch, key[0])
+                old_val = getattr(old_batch, key[0])
+
+                if torch.is_tensor(old_val):
+                    assert torch.is_tensor(new_val)
+                    if torch.is_floating_point(old_val):
+                        assert torch.is_floating_point(new_val)
+                        logging.info(f"key {key[0]} old_val.dtype: {old_val.dtype}")
+                        logging.info(f"key {key[0]} new_val.dtype: {new_val.dtype}")
+                        same = torch.allclose(old_val, new_val, rtol=1e-6, atol=1e-8)
+                    else:
+                        same = torch.equal(old_val, new_val)
+                else:
+                    same = old_val == new_val
+                
+                if not same:
+                    all_same = False
+                    torch.set_printoptions(threshold=float('inf'))
+                    logging.info(f"[not same] {key[0]}")
+                    logging.info(f"key {key[0]} old val: {old_val}")
+                    logging.info(f"key {key[0]} new val: {new_val}")
         
-        import logging
+        compare_batch(new_batch, batched_data)
+        
+        logging.info(f"type(batched_data): {type(batched_data)}")
+        logging.info(f"batched_data: {batched_data}")
+        logging.info(f"batched_data.node_attr: {batched_data.node_attr}")
+
         logging.debug(f"batched_data: {batched_data}")
         # logging.debug(f"batched_data[pos]: {batched_data['pos']}")
         # logging.debug(f"batched_data[x]: {batched_data['x']}")
@@ -349,6 +397,165 @@ class SevenNetCalculator(Calculator):
         # logging.debug(f"predictions['forces'] = {predictions['forces']}")
         # logging.debug(f"predictions['stress'] = {predictions['stress']}")
         return predictions
+
+
+
+    def predict(self, atoms_list, properties=None):
+        
+        # if len(atoms_list) == 1:
+        #     output = self.predict_one(atoms_list[0])
+        #     predictions = {}
+        #     predictions['energy'] = output[KEY.PRED_TOTAL_ENERGY].to(torch.float64).unsqueeze(0)
+        #     predictions['forces'] = output[KEY.PRED_FORCE].to(torch.float64).unsqueeze(0)
+        #     voigt = (-output[KEY.PRED_STRESS])[[0, 1, 2, 4, 5, 3]].to(torch.float64).unsqueeze(0)
+        #     stress_list = []
+        #     for i in range(voigt.shape[0]):
+        #         stress_list.append(self._stress2tensor(voigt[i,:]))
+        #     predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3)
+        #     return predictions
+
+
+        if not atoms_list:
+            raise ValueError("Empty atoms_list provided")
+            
+        if not isinstance(atoms_list, list):
+            atoms_list = [atoms_list]
+
+        # Convert atoms to graph data
+        graph_list = []
+        for atoms in atoms_list:
+            data = AtomGraphData.from_numpy_dict(
+                unlabeled_atoms_to_graph(atoms, self.cutoff)
+            )
+            if self.modal:
+                data[KEY.DATA_MODALITY] = self.modal
+                
+            if isinstance(self.model, torch_script_type):
+                data[KEY.NODE_FEATURE] = torch.tensor(
+                    [self.type_map[z.item()] for z in data[KEY.NODE_FEATURE]],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                data[KEY.POS].requires_grad_(True)  # backward compatibility
+                data[KEY.EDGE_VEC].requires_grad_(True)  # backward compatibility
+                
+            graph_list.append(data)
+            
+        # Process graphs based on model type
+        # was_batch_mode = True
+        if isinstance(self.model, AtomGraphSequential):
+            # was_batch_mode = self.model.is_batch_data
+            self.model.set_is_batch_data(True)
+            self.model.eval()
+            
+        # Batch the data if there are multiple atoms
+        from torch_geometric.loader.dataloader import Collater
+        batched_data = Collater(graph_list)(graph_list)
+        batched_data = batched_data.to(self.device)
+
+        logging.debug(f"batched_data: {batched_data}")
+        # logging.debug(f"batched_data[pos]: {batched_data['pos']}")
+        # logging.debug(f"batched_data[x]: {batched_data['x']}")
+        logging.debug(f"batched_data[cell_lattice_vectors]: {batched_data['cell_lattice_vectors']}")
+        logging.debug(f"batched_data[cell_volume]: {batched_data['cell_volume']}")
+        # Run model on batched data
+        if isinstance(self.model, torch_script_type):
+            batched_dict = batched_data.to_dict()
+            if 'data_info' in batched_dict:
+                del batched_dict['data_info']
+            output = self.model(batched_dict)
+        else:
+            output = self.model(batched_data)
+            
+        # Convert to list of individual outputs using util.to_atom_graph_list
+        # logging.info(f"input: {batched_data}")
+        # logging.info(f"output[{KEY.PRED_TOTAL_ENERGY}] = {output[KEY.PRED_TOTAL_ENERGY]}")
+        # logging.info(f"output[{KEY.PRED_FORCE}] = {output[KEY.PRED_FORCE]}")
+        # logging.info(f"output[{KEY.PRED_STRESS}] = {output[KEY.PRED_STRESS]}")
+
+        predictions = {}
+        predictions['energy'] = output[KEY.PRED_TOTAL_ENERGY].to(torch.float64).detach()
+        predictions['forces'] = output[KEY.PRED_FORCE].to(torch.float64).detach()
+        voigt = (-output[KEY.PRED_STRESS])[:, [0, 1, 2, 4, 5, 3]].to(torch.float64).detach()
+        stress_list = []
+        for i in range(voigt.shape[0]):
+            stress_list.append(self._stress2tensor(voigt[i,:]))
+        predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3).detach()
+
+        # logging.debug(f"predictions['energy'] = {predictions['energy']}")
+        # logging.debug(f"predictions['forces'] = {predictions['forces']}")
+        # logging.debug(f"predictions['stress'] = {predictions['stress']}")
+        return predictions
+
+    def fast_predict(self, gbatch):
+        batch = self.convert_batch(gbatch)
+        # TODO: Whether we should set `pos` and `edge_vec` requires_grad_(True)?
+        batch.pos.requires_grad_(True)  # backward compatibility
+        batch.edge_vec.requires_grad_(True)  # backward compatibility
+
+        if isinstance(self.model, torch_script_type):
+            batched_dict = batch.to_dict()
+            if 'data_info' in batched_dict:
+                del batched_dict['data_info']
+            output = self.model(batched_dict)
+        else:
+            output = self.model(batch)
+
+        predictions = {}
+        predictions['energy'] = output[KEY.PRED_TOTAL_ENERGY].to(torch.float64).detach()
+        predictions['forces'] = output[KEY.PRED_FORCE].to(torch.float64).detach()
+        voigt = (-output[KEY.PRED_STRESS])[:, [0, 1, 2, 4, 5, 3]].to(torch.float64).detach()
+        stress_list = []
+        for i in range(voigt.shape[0]):
+            stress_list.append(self._stress2tensor(voigt[i,:]))
+        predictions['stress'] = torch.stack(stress_list, dim=0).view(-1,3,3).detach()
+
+        return predictions
+        
+
+    def convert_batch(self, gbatch):
+        from batchopt import radius_graph_pbc_cuda
+
+        edge_indices, cell_offsets, num_neighbors = radius_graph_pbc_cuda(
+            gbatch,
+            radius=self.cutoff,
+            max_num_neighbors_threshold=float('inf'),
+            pbc=[True, True, True],
+            dtype=torch.float32
+        )
+
+        tmp = edge_indices[0].clone()
+        edge_indices[0] = edge_indices[1]
+        edge_indices[1] = tmp
+
+        cell = gbatch.cell
+        pos = gbatch.pos
+        edge_batch = gbatch.batch[edge_indices[0]]  # batch index of edge start
+        cell_matrices = cell[edge_batch]
+        edge_vec = pos[edge_indices[1]] - pos[edge_indices[0]] + torch.bmm(cell_offsets.unsqueeze(1), cell_matrices).squeeze(1)
+        
+        cell_volume = torch.abs(torch.det(cell))
+
+        # TODO: Figure out whether torch_geometric.data.Batch is the right way to create a batch
+        from torch_geometric.data import Batch
+        batch = Batch(
+            x=gbatch.atomic_numbers,
+            edge_index=edge_indices,
+            pos=pos.to(torch.float32),
+            node_attr=gbatch.atomic_numbers,
+            atomic_numbers=gbatch.atomic_numbers.to(torch.int64),
+            edge_vec=edge_vec.to(torch.float32),
+            cell_lattice_vectors=cell.view(-1, 3).to(torch.float32),
+            pbc_shift=cell_offsets.to(torch.float32),
+            cell_volume=cell_volume.to(torch.float32),
+            num_atoms=gbatch.natoms,
+            data_info={},
+            batch=gbatch.batch,
+            ptr=gbatch.ptr,
+        )
+
+        return batch
+
 
     def _stress2tensor(self, stress):
         tensor = torch.tensor(
